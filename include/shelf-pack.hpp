@@ -299,7 +299,7 @@ struct ShelfPacker {
 
                 outputFile << svg_fmt::Rectangle(item.x, shelf.y, item.w, shelf.h)
                                   .WithFill(color)
-                                  .WithStroke(Stroke(2, Color::Black()))
+                                  .WithStroke(Stroke(1, Color::Black()))
                            << std::endl;
 
                 itemIdx = item.next;
