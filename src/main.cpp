@@ -1,16 +1,14 @@
 #include <shelf-pack.hpp>
 
 int main() {
-    ShelfPacker pack(1024, 1024);
+    ShelfPacker pack(Size2U(200, 200));
 
-    pack.PackOne(20, 20);
-    pack.PackOne(20, 20);
-    pack.PackOne(20, 20);
-    pack.PackOne(23, 15);
-    pack.PackOne(32, 20);
-    pack.PackOne(10, 23);
-    pack.PackOne(23, 15);
-    pack.PackOne(10, 57);
+    pack.PackOne(Size2U(20, 20));
+    pack.PackOne(Size2U(20, 20));
+    pack.PackOne(Size2U(20, 20));
+    pack.PackOne(Size2U(45, 12));
+
+    pack.DumpSVG();
 
     return 0;
 }

@@ -13,6 +13,14 @@ function smake.install()
 
         folder:Delete()
     end)
+
+    InstallDependency('smath', function(installer)
+        local folder = installer:GitClone('https://github.com/Antfroze/smath')
+
+        folder:MoveIncludeFolder()
+
+        folder:Delete()
+    end)
 end
 
 function smake.build()
@@ -26,8 +34,9 @@ function smake.build()
     inputr('src')
     include('include')
 
-    IncludeDependencies('svg-format')
+    IncludeDependencies('svg-format', 'smath')
 
+    generateCompileFlags()
     output('out/shelf-pack')
     build()
 

@@ -3,3 +3,4 @@ smake
 .vscode
 output.svg
 dependencies
+compile_flags.txt

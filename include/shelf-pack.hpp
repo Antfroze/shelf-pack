@@ -1,202 +1,279 @@
 #pragma once
 
+#include <assert.h>
 #include <fstream>
-#include <map>
+#include <optional>
+#include <smath.hpp>
+#include <svg-format.hpp>
 #include <vector>
 
-#ifdef SHELFPACK_DEBUG
-#include <svg-format.hpp>
 using namespace svg_fmt;
-#endif
+using namespace smath;
 
-struct Bin {
-    inline Bin(int id, int x, int y, int w, int h, int maxW = -1, int maxH = -1)
-        : id(id), x(x), y(y), w(w), h(h), maxW(maxW), maxH(maxH) {
-        this->maxW = maxW == -1 ? w : maxW;
-        this->maxH = maxH == -1 ? h : maxH;
-    }
-
-    int id;
-    int x, y;
-    int w, h, maxW, maxH;
-    int refCount;
-};
+const unsigned SHELF_SPLIT_THRESHOLD = 8;
+const unsigned ITEM_SPLIT_THRESHOLD = 8;
 
 struct Shelf {
-    inline Shelf(int y, int w, int h) : x(0), y(y), w(w), h(h), free(w) {}
-
-    inline Bin* Allocate(int w, int h, int id = -1) {
-        if (w > free || h > this->h) {
-            return nullptr;
-        }
-
-        int x = this->x;
-        this->x += w;
-        this->free -= w;
-        return new Bin(id, x, this->y, w, h, w, this->h);
-    }
-
-    inline void Resize(int w) {
-        this->free += (w - this->w);
-        this->w = w;
-    }
-
-    int x, y;
-    int w, h;
-    int free;
+    unsigned x, y, w, h;
+    int prev, next, firstItem;
+    bool isEmpty;
 };
 
-struct PackerOptions {
-    inline PackerOptions() : autoResize(false) {}
-
-    bool autoResize;
+struct Item {
+    unsigned x, y, w, h;
+    int prev, next, shelf;
+    bool allocated;
+    unsigned generation;
 };
 
-class ShelfPacker {
-   public:
-    inline ShelfPacker(int w, int h, const PackerOptions& options = PackerOptions())
-        : w(w), h(h), options(options) {}
+struct Allocation {
+    unsigned id;
+    RectI rectangle;
+};
 
-    inline Bin* GetBin(int id) { return bins.at(id); }
-    inline int Ref(Bin& bin) {
-        if (++bin.refCount == 1) {    // a new Bin.. record height in stats histogram..
-            stats[bin.h] = (stats[bin.h] | 0) + 1;
-        }
+struct ShelfPackerOptions {
+    inline ShelfPackerOptions() : numColumns(1) {}
 
-        return bin.refCount;
-    };
-    inline int Unref(Bin& bin) {
-        if (bin.refCount == 0) {
-            return 0;
-        }
+    unsigned numColumns;
+};
 
-        if (--bin.refCount == 0) {
-            this->stats[bin.h]--;
-            bins.erase(bin.id);
-            this->freeBins.push_back(&bin);
-        }
+struct ShelfPacker {
+    inline ShelfPacker(const Size2U& size, const ShelfPackerOptions& opts = ShelfPackerOptions())
+        : size(size) {
+        shelfWidth = size.x / opts.numColumns;
 
-        return bin.refCount;
+        Init();
     }
 
-    Bin* PackOne(int w, int h, int id = -1) {
-        int y = 0;
-        int waste = 0;
+    inline void Init() {
+        assert(size.x > 0 && size.y > 0);
+        assert(size.x <= std::numeric_limits<unsigned>::max() &&
+               size.y <= std::numeric_limits<unsigned>::max());
 
-        struct {
-            Shelf* shelf = nullptr;
-            Bin* freebin = nullptr;
-            int waste = std::numeric_limits<std::int32_t>::max();
-        } best;
+        shelves.clear();
+        items.clear();
 
-        // if id was supplied, attempt a lookup..
-        if (id != -1) {
-            Bin* pbin = GetBin(id);
-            if (pbin) {    // we packed this bin already
-                Ref(*pbin);
-                return pbin;
+        unsigned numColumns = size.x / shelfWidth;
+        int prev = -1;
+
+        for (int i = 0; i < numColumns; ++i) {
+            int firstItem = items.size();
+            unsigned x = i * shelfWidth;
+            int next = i + 1 < numColumns ? i + 1 : -1;
+
+            shelves.emplace_back(Shelf{
+                x,
+                0,
+                0,
+                size.y,
+                prev,
+                next,
+                firstItem,
+                true,
+            });
+
+            items.emplace_back(Item{x, 0, shelfWidth, 0, -1, -1, i, false, 1});
+
+            prev = i;
+        }
+
+        firstShelf = allocatedSpace = 0;
+        freeItems = freeShelves = -1;
+    }
+
+    inline std::optional<Allocation> PackOne(const Size2U& size) {
+        if (size.IsEmpty() || size.x > std::numeric_limits<unsigned>::max() &&
+                                  size.y > std::numeric_limits<unsigned>::max()) {
+            return std::nullopt;
+        }
+
+        if (size.x > shelfWidth || size.y > this->size.y) {
+            return std::nullopt;
+        }
+
+        unsigned width = size.x;
+        unsigned height = GetShelfHeight(size.y);
+        int selectedShelfHeight, selectedShelf, selectedItem = -1;
+
+        int shelfIdx = firstShelf;
+        while (shelfIdx != -1) {
+            Shelf& shelf = shelves.at(shelfIdx);
+
+            if (shelf.h < height || shelf.h >= selectedShelfHeight ||
+                (!shelf.isEmpty && shelf.h > height + height / 2)) {
+                shelfIdx = shelf.next;
+                continue;
             }
-            maxId = std::max(id, maxId);
+
+            int itemIdx = shelf.firstItem;
+            while (itemIdx != -1) {
+                Item& item = items[itemIdx];
+
+                if (!item.allocated && item.w >= width) {
+                    break;
+                }
+                itemIdx = item.next;
+            }
+
+            if (itemIdx != -1) {
+                selectedShelf = shelfIdx;
+                selectedShelfHeight = shelf.h;
+                selectedItem = itemIdx;
+
+                if (shelf.h == height) {
+                    // Perfect fit, stop searching.
+                    break;
+                }
+            }
+
+            shelfIdx = shelf.next;
+        }
+
+        if (selectedShelf == -1) {
+            return std::nullopt;
+        }
+
+        Shelf shelf = shelves.at(selectedShelf);
+        if (shelf.isEmpty) {
+            shelves.at(selectedShelf).isEmpty = false;
+        }
+
+        if (shelf.isEmpty && shelf.h > height + SHELF_SPLIT_THRESHOLD) {
+            // Split the empty shelf into one of the desired size and a new
+            // empty one with a single empty item.
+
+            int newShelfIdx = AddShelf(Shelf{
+                shelf.x,
+                shelf.y + height,
+                0,
+                shelf.h - height,
+                selectedShelf,
+                shelf.next,
+                -1,
+                true,
+            });
+
+            int newItemIdx = AddItem(Item{
+                shelf.x,
+                0,
+                shelfWidth,
+                0,
+                -1,
+                -1,
+                newShelfIdx,
+                false,
+                1,
+            });
+
+            shelves.at(newShelfIdx).firstItem = newItemIdx;
+            int next = shelves.at(selectedShelf).next;
+            shelves.at(selectedShelf).h = height;
+            shelves.at(selectedShelf).next = newShelfIdx;
+
+            if (next != -1) {
+                shelves.at(next).prev = newShelfIdx;
+            }
         } else {
-            id = ++maxId;
+            height = shelf.h;
         }
 
-        // First try to reuse a free bin..
-        for (const auto& bin : freeBins) {
-            // exactly the right height and width, use it..
-            if (h == bin->maxH && w == bin->maxW) {
-                return allocFreebin(bin, w, h, id);
+        Item item = items.at(selectedItem);
+        if (item.w - width > ITEM_SPLIT_THRESHOLD) {
+            int newItemIdx = AddItem(Item{
+                item.x + width,
+                0,
+                item.w - width,
+                0,
+                selectedItem,
+                item.next,
+                item.shelf,
+                false,
+                1,
+            });
+
+            items.at(selectedItem).w = width;
+            items.at(selectedItem).next = newItemIdx;
+
+            if (item.next != -1) {
+                items.at(item.next).prev = newItemIdx;
             }
-            // not enough height or width, skip it..
-            if (h > bin->maxH || w > bin->maxW) {
-                continue;
-            }
-            // extra height or width, minimize wasted area..
-            if (h <= bin->maxH && w <= bin->maxW) {
-                waste = (bin->maxW * bin->maxH) - (w * h);
-                if (waste < best.waste) {
-                    best.waste = waste;
-                    best.freebin = bin;
-                }
-            }
+        } else {
+            width = item.w;
         }
 
-        // Next find the best shelf..
-        for (auto& shelf : shelves) {
-            y += shelf.h;
+        items.at(selectedItem).allocated = true;
+        unsigned generation = items.at(selectedItem).generation;
 
-            // not enough width on this shelf, skip it..
-            if (w > shelf.free) {
-                continue;
-            }
+        unsigned x0 = item.x;
+        unsigned y0 = shelf.y;
 
-            // exactly the right height, pack it..
-            if (h == shelf.h) {
-                return allocShelf(shelf, w, h, id);
-            }
+        RectI rectangle(Vector2I(item.x, shelf.y), Vector2I(width, height));
 
-            // not enough height, skip it..
-            if (h > shelf.h) {
-                continue;
-            }
+        allocatedSpace += rectangle.GetArea();
 
-            // extra height, minimize wasted area..
-            if (h < shelf.h) {
-                waste = (shelf.h - h) * w;
-                if (waste < best.waste) {
-                    best.waste = waste;
-                    best.shelf = &shelf;
-                }
-            }
-        }
-        if (best.freebin != nullptr) {
-            return allocFreebin(best.freebin, w, h, id);
-        }
-
-        if (best.shelf != nullptr) {
-            return allocShelf(*best.shelf, w, h, id);
-        }
-
-        // No free bins or shelves.. add shelf..
-        if (h <= (this->h - y) && w <= this->w) {
-            shelves.emplace_back(y, this->w, h);
-            return allocShelf(shelves.back(), w, h, id);
-        }
-
-        // No room for more shelves..
-        // If `autoResize` option is set, grow the sprite as follows:
-        //  * double whichever sprite dimension is smaller (`w1` or `h1`)
-        //  * if sprite dimensions are equal, grow width before height
-        //  * accomodate very large bin requests (big `w` or `h`)
-        if (options.autoResize) {
-            int h1, h2, w1, w2;
-
-            h1 = h2 = this->h;
-            w1 = w2 = this->w;
-
-            if (w1 <= h1 || w > w1) {    // grow width..
-                w2 = std::max(w, w1) * 2;
-            }
-            if (h1 < w1 || h > h1) {    // grow height..
-                h2 = std::max(h, h1) * 2;
-            }
-
-            Resize(w2, h2);
-            return PackOne(w, h, id);    // retry
-        }
-
-        return nullptr;
+        return std::make_optional(Allocation{
+            selectedItem | generation << 16,
+            rectangle,
+        });
     }
 
-    inline void Resize(int w, int h) {
-        this->w = w;
-        this->h = h;
-        for (auto& shelf : shelves) {
-            shelf.Resize(w);
+    int AddItem(Item item) {
+        if (freeItems != -1) {
+            int idx = freeItems;
+            item.generation = items.at(idx).generation += 1;
+            freeItems = items.at(idx).next;
+            items[idx] = item;
+
+            return idx;
         }
+
+        int idx = items.size();
+        items.emplace_back(item);
+
+        return idx;
     }
 
-#ifdef SHELFPACK_DEBUG
+    int AddShelf(Shelf shelf) {
+        if (freeShelves != -1) {
+            int idx = freeShelves;
+            freeShelves = shelves.at(idx).next;
+            shelves[idx] = shelf;
+
+            return idx;
+        }
+
+        int idx = shelves.size();
+        shelves.emplace_back(shelf);
+
+        return idx;
+    }
+
+    int GetShelfHeight(int size) {
+        int alignment;
+
+        if (size >= 0 && size <= 31) {
+            alignment = 8;
+        } else if (size >= 32 && size <= 127) {
+            alignment = 16;
+        } else if (size >= 128 && size <= 511) {
+            alignment = 32;
+        } else {
+            alignment = 64;
+        }
+
+        int adjusted_size = size;
+        int rem = size % alignment;
+
+        if (rem > 0) {
+            adjusted_size = size + alignment - rem;
+            if (adjusted_size > this->size.y) {
+                adjusted_size = size;
+            }
+        }
+
+        return adjusted_size;
+    }
+
     inline void DumpSVG() {
         std::ofstream outputFile("output.svg");    // Open the output file stream
 
@@ -207,51 +284,41 @@ class ShelfPacker {
         }
 
         // Write the SVG content to the output file
-        outputFile << SVG::Begin(w, h) << std::endl;
-        outputFile << Rectangle(0, 0, w, h) << std::endl;
+        outputFile << SVG::Begin(size.x, size.y) << std::endl;
+        outputFile << svg_fmt::Rectangle(0, 0, size.x, size.y) << std::endl;
 
-        for (const auto& kv : bins) {
-            const Bin& bin = *kv.second;
-            outputFile << Rectangle(bin.x, bin.y, bin.w, bin.h)
-                              .WithFill(Color::Red())
-                              .WithStroke(Stroke(2, Color::Blue()))
-                       << std::endl;
+        int shelfIdx = firstShelf;
+        while (shelfIdx != -1) {
+            Shelf& shelf = shelves.at(shelfIdx);
+
+            int itemIdx = shelf.firstItem;
+            while (itemIdx != -1) {
+                Item& item = items.at(itemIdx);
+
+                Color color = item.allocated ? Color(70, 70, 180) : Color(50, 50, 50);
+
+                outputFile << svg_fmt::Rectangle(item.x, shelf.y, item.w, shelf.h)
+                                  .WithFill(color)
+                                  .WithStroke(Stroke(2, Color::Black()))
+                           << std::endl;
+
+                itemIdx = item.next;
+            }
+
+            shelfIdx = shelf.next;
         }
 
         outputFile << SVG::End() << std::endl;
 
         outputFile.close();    // Close the output file stream
     }
-#endif
-
-   private:
-    inline Bin* allocFreebin(Bin* bin, int w, int h, int id) {
-        freeBins.erase(std::remove(freeBins.begin(), freeBins.end(), bin), freeBins.end());
-        bin->id = id;
-        bin->w = w;
-        bin->h = h;
-        bin->refCount = 0;
-        bins[id] = bin;
-        Ref(*bin);
-        return bin;
-    }
-
-    inline Bin* allocShelf(Shelf& shelf, int w, int h, int id) {
-        Bin* pbin = shelf.Allocate(w, h, id);
-
-        if (pbin) {
-            bins[id] = pbin;
-            Ref(*pbin);
-        }
-        return pbin;
-    }
-
-    int w, h;
-    const PackerOptions& options;
 
     std::vector<Shelf> shelves;
-    std::vector<Bin*> freeBins;
-    std::map<int, Bin*> bins;
-    std::map<int, int> stats;
-    int maxId = 0;
+    std::vector<Item> items;
+
+    Vector2U size;
+    int firstShelf;
+    int freeItems, freeShelves = -1;
+    unsigned shelfWidth;
+    int allocatedSpace;
 };
