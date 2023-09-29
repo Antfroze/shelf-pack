@@ -2,10 +2,12 @@
 
 #include <fstream>
 #include <map>
-#include <svg-format.hpp>
 #include <vector>
 
+#ifdef SHELFPACK_DEBUG
+#include <svg-format.hpp>
 using namespace svg_fmt;
+#endif
 
 struct Bin {
     inline Bin(int id, int x, int y, int w, int h, int maxW = -1, int maxH = -1)
@@ -194,6 +196,7 @@ class ShelfPacker {
         }
     }
 
+#ifdef SHELFPACK_DEBUG
     inline void DumpSVG() {
         std::ofstream outputFile("output.svg");    // Open the output file stream
 
@@ -219,6 +222,7 @@ class ShelfPacker {
 
         outputFile.close();    // Close the output file stream
     }
+#endif
 
    private:
     inline Bin* allocFreebin(Bin* bin, int w, int h, int id) {
