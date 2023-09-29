@@ -38,7 +38,7 @@ struct ShelfPackerOptions {
 };
 
 struct ShelfPacker {
-    inline ShelfPacker(const Size2U& size, const ShelfPackerOptions& opts = ShelfPackerOptions())
+    inline ShelfPacker(const SizeU& size, const ShelfPackerOptions& opts = ShelfPackerOptions())
         : size(size) {
         shelfWidth = size.x / opts.numColumns;
 
@@ -81,7 +81,7 @@ struct ShelfPacker {
         freeItems = freeShelves = -1;
     }
 
-    inline std::optional<Allocation> PackOne(const Size2U& size) {
+    inline std::optional<Allocation> PackOne(const SizeU& size) {
         if (size.IsEmpty() || size.x > std::numeric_limits<unsigned>::max() &&
                                   size.y > std::numeric_limits<unsigned>::max()) {
             return std::nullopt;
