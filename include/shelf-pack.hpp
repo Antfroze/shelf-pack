@@ -4,10 +4,13 @@
 #include <fstream>
 #include <optional>
 #include <smath.hpp>
-#include <svg-format.hpp>
 #include <vector>
 
+#ifdef SHELFPACK_DEBUG
+#include <svg-format.hpp>
 using namespace svg_fmt;
+#endif
+
 using namespace smath;
 
 const unsigned SHELF_SPLIT_THRESHOLD = 8;
@@ -23,7 +26,6 @@ struct Item {
     unsigned x, y, w, h;
     int prev, next, shelf;
     bool allocated;
-    unsigned generation;
 };
 
 struct Allocation {
@@ -37,7 +39,8 @@ struct ShelfPackerOptions {
     unsigned numColumns;
 };
 
-struct ShelfPacker {
+class ShelfPacker {
+   public:
     inline ShelfPacker(const SizeU& size, const ShelfPackerOptions& opts = ShelfPackerOptions())
         : size(size) {
         shelfWidth = size.x / opts.numColumns;
@@ -45,43 +48,7 @@ struct ShelfPacker {
         Init();
     }
 
-    inline void Init() {
-        assert(size.x > 0 && size.y > 0);
-        assert(size.x <= std::numeric_limits<unsigned>::max() &&
-               size.y <= std::numeric_limits<unsigned>::max());
-
-        shelves.clear();
-        items.clear();
-
-        unsigned numColumns = size.x / shelfWidth;
-        int prev = -1;
-
-        for (int i = 0; i < numColumns; ++i) {
-            int firstItem = items.size();
-            unsigned x = i * shelfWidth;
-            int next = i + 1 < numColumns ? i + 1 : -1;
-
-            shelves.emplace_back(Shelf{
-                x,
-                0,
-                0,
-                size.y,
-                prev,
-                next,
-                firstItem,
-                true,
-            });
-
-            items.emplace_back(Item{x, 0, shelfWidth, 0, -1, -1, i, false, 1});
-
-            prev = i;
-        }
-
-        firstShelf = allocatedSpace = 0;
-        freeItems = freeShelves = -1;
-    }
-
-    inline std::optional<Allocation> PackOne(const SizeU& size) {
+    inline std::optional<Allocation> Allocate(const SizeU& size) {
         if (size.IsEmpty() || size.x > std::numeric_limits<unsigned>::max() &&
                                   size.y > std::numeric_limits<unsigned>::max()) {
             return std::nullopt;
@@ -162,7 +129,6 @@ struct ShelfPacker {
                 -1,
                 newShelfIdx,
                 false,
-                1,
             });
 
             shelves.at(newShelfIdx).firstItem = newItemIdx;
@@ -188,7 +154,6 @@ struct ShelfPacker {
                 item.next,
                 item.shelf,
                 false,
-                1,
             });
 
             items.at(selectedItem).w = width;
@@ -202,7 +167,6 @@ struct ShelfPacker {
         }
 
         items.at(selectedItem).allocated = true;
-        unsigned generation = items.at(selectedItem).generation;
 
         unsigned x0 = item.x;
         unsigned y0 = shelf.y;
@@ -212,68 +176,107 @@ struct ShelfPacker {
         allocatedSpace += rectangle.GetArea();
 
         return std::make_optional(Allocation{
-            selectedItem | generation << 16,
+            (unsigned)selectedItem,
             rectangle,
         });
     }
 
-    int AddItem(Item item) {
-        if (freeItems != -1) {
-            int idx = freeItems;
-            item.generation = items.at(idx).generation += 1;
-            freeItems = items.at(idx).next;
-            items[idx] = item;
+    inline void DeAllocate(int id) {
+        Item& item = items.at(id);
 
-            return idx;
+        assert(item.allocated);
+
+        Item copy = item;
+
+        item.allocated = false;
+        allocatedSpace -= copy.w * shelves.at(item.shelf).h;
+
+        if (copy.next != -1 && !items.at(copy.next).allocated) {
+            // Merge the next item into this one.
+
+            Item& next = items.at(copy.next);
+            item.next = next.next;
+            item.w += next.w;
+            copy.w = item.w;
+
+            if (item.next != -1) {
+                items[next.next].prev = id;
+            }
+
+            // Add next to the free list.
+            RemoveItem(copy.next);
         }
 
-        int idx = items.size();
-        items.emplace_back(item);
+        if (copy.prev != -1 && !items.at(copy.prev).allocated) {
+            // Merge the item into the previous one.
 
-        return idx;
-    }
+            Item& prev = items.at(copy.prev);
+            prev.next = copy.next;
+            prev.w += copy.w;
 
-    int AddShelf(Shelf shelf) {
-        if (freeShelves != -1) {
-            int idx = freeShelves;
-            freeShelves = shelves.at(idx).next;
-            shelves[idx] = shelf;
+            if (copy.next != -1) {
+                items.at(copy.next).prev = copy.prev;
+            }
 
-            return idx;
+            // Add item_idx to the free list.
+            RemoveItem(id);
+
+            copy.prev = prev.prev;
         }
 
-        int idx = shelves.size();
-        shelves.emplace_back(shelf);
+        if (copy.prev == -1 && copy.next == -1) {
+            int shelfIdx = copy.shelf;
+            Shelf& shelf = shelves.at(shelfIdx);
+            // The shelf is now empty.
+            shelf.isEmpty = true;
 
-        return idx;
-    }
+            // Only attempt to merge shelves on the same column.
+            unsigned x = shelf.x;
 
-    int GetShelfHeight(int size) {
-        int alignment;
+            int nextShelf = shelf.next;
+            if (nextShelf != -1 && shelves.at(nextShelf).isEmpty && shelves.at(nextShelf).x == x) {
+                // Merge the next shelf into this one.
 
-        if (size >= 0 && size <= 31) {
-            alignment = 8;
-        } else if (size >= 32 && size <= 127) {
-            alignment = 16;
-        } else if (size >= 128 && size <= 511) {
-            alignment = 32;
-        } else {
-            alignment = 64;
-        }
+                Shelf& next = shelves[nextShelf];
+                shelf.next = next.next;
+                shelf.h += next.h;
 
-        int adjusted_size = size;
-        int rem = size % alignment;
+                if (next.next != -1) {
+                    shelves.at(next.next).prev = shelfIdx;
+                }
 
-        if (rem > 0) {
-            adjusted_size = size + alignment - rem;
-            if (adjusted_size > this->size.y) {
-                adjusted_size = size;
+                // Add next to the free list.
+                RemoveShelf(nextShelf);
+            }
+
+            int prevShelfIdx = shelf.prev;
+            if (prevShelfIdx != -1 && shelves[prevShelfIdx].isEmpty &&
+                shelves[prevShelfIdx].x == x) {
+                // Merge the shelf into the previous one.
+
+                Shelf& prev = shelves[prevShelfIdx];
+                int nextShelf = shelf.next;
+
+                prev.next = nextShelf;
+                prev.h += shelf.h;
+
+                if (nextShelf != -1) {
+                    shelves[nextShelf].prev = prevShelfIdx;
+                }
+
+                // Add the shelf to the free list.
+                RemoveShelf(shelfIdx);
             }
         }
-
-        return adjusted_size;
     }
 
+    inline void Clear() { Init(); }
+
+    inline SizeU GetSize() const { return size; }
+    inline int GetAllocatedSpace() const { return allocatedSpace; }
+    inline int GetFreeSpace() const { return size.Length() - allocatedSpace; }
+
+#ifdef SHELFPACK_DEBUG
     inline void DumpSVG() {
         std::ofstream outputFile("output.svg");    // Open the output file stream
 
@@ -312,11 +315,116 @@ struct ShelfPacker {
 
         outputFile.close();    // Close the output file stream
     }
+#endif
+
+   private:
+    inline void Init() {
+        assert(size.x > 0 && size.y > 0);
+        assert(size.x <= std::numeric_limits<unsigned>::max() &&
+               size.y <= std::numeric_limits<unsigned>::max());
+
+        shelves.clear();
+        items.clear();
+
+        unsigned numColumns = size.x / shelfWidth;
+        int prev = -1;
+
+        for (int i = 0; i < numColumns; ++i) {
+            int firstItem = items.size();
+            unsigned x = i * shelfWidth;
+            int next = i + 1 < numColumns ? i + 1 : -1;
+
+            shelves.emplace_back(Shelf{
+                x,
+                0,
+                0,
+                size.y,
+                prev,
+                next,
+                firstItem,
+                true,
+            });
+
+            items.emplace_back(Item{x, 0, shelfWidth, 0, -1, -1, i, false});
+
+            prev = i;
+        }
+
+        firstShelf = allocatedSpace = 0;
+        freeItems = freeShelves = -1;
+    }
+
+    inline int AddItem(Item item) {
+        if (freeItems != -1) {
+            int idx = freeItems;
+            freeItems = items.at(idx).next;
+            items[idx] = item;
+
+            return idx;
+        }
+
+        int idx = items.size();
+        items.emplace_back(item);
+
+        return idx;
+    }
+
+    inline int AddShelf(Shelf shelf) {
+        if (freeShelves != -1) {
+            int idx = freeShelves;
+            freeShelves = shelves.at(idx).next;
+            shelves[idx] = shelf;
+
+            return idx;
+        }
+
+        int idx = shelves.size();
+        shelves.emplace_back(shelf);
+
+        return idx;
+    }
+
+    inline void RemoveItem(int idx) {
+        items.at(idx).next = freeItems;
+        freeItems = idx;
+    }
+
+    inline void RemoveShelf(int idx) {
+        RemoveItem(shelves.at(idx).firstItem);
+        shelves.at(idx).next = freeShelves;
+        freeShelves = idx;
+    }
+
+    inline int GetShelfHeight(int size) {
+        int alignment;
+
+        if (size >= 0 && size <= 31) {
+            alignment = 8;
+        } else if (size >= 32 && size <= 127) {
+            alignment = 16;
+        } else if (size >= 128 && size <= 511) {
+            alignment = 32;
+        } else {
+            alignment = 64;
+        }
+
+        int adjusted_size = size;
+        int rem = size % alignment;
+
+        if (rem > 0) {
+            adjusted_size = size + alignment - rem;
+            if (adjusted_size > this->size.y) {
+                adjusted_size = size;
+            }
+        }
+
+        return adjusted_size;
+    }
 
     std::vector<Shelf> shelves;
     std::vector<Item> items;
 
-    Vector2U size;
+    SizeU size;
     int firstShelf;
     int freeItems, freeShelves = -1;
     unsigned shelfWidth;
